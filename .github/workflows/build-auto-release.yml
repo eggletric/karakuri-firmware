@@ -1,0 +1,135 @@
+name: Build & Auto Release Karakuri firmware
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize runs so that tag numbering and pushes cannot race each other
+concurrency:
+  group: build-auto-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # need full history for tags
+
+      - name: Set up Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install rp2040 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls \
+            https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
+          arduino-cli core update-index
+          arduino-cli core install rp2040:rp2040
+
+      - name: Determine next version tag
+        id: version
+        run: |
+          git fetch --tags --force
+          # Only consider tags in vX.Y.Z form (a form like v1.2 would break the numbering)
+          LAST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          echo "Last tag: $LAST_TAG"
+          if [ -z "$LAST_TAG" ]; then
+            NEXT_TAG="v0.0.1"
+          else
+            BASE=${LAST_TAG#v}
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE"
+            PATCH=$((PATCH + 1))
+            NEXT_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          if git rev-parse -q --verify "refs/tags/$NEXT_TAG" >/dev/null; then
+            echo "Tag $NEXT_TAG already exists"; exit 1
+          fi
+          echo "Next tag: $NEXT_TAG"
+          echo "tag=$NEXT_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${NEXT_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate version.h
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "#pragma once" > firmware/pico_switch_pad/version.h
+          echo "#define FW_VERSION \"${VERSION}\"" >> firmware/pico_switch_pad/version.h
+
+      - name: Build firmware (Pico W / Pico 2 W)
+        run: |
+          # A UF2 family ID differs per chip generation (RP2040 / rp2350-arm-s), so a
+          # single file cannot cover both boards. Build them one board at a time.
+          build_one() {
+            FQBN="$1"; OPTS="$2"; OUT="$3"
+            echo "::group::build $OUT ($FQBN)"
+            rm -rf build
+            # Pin the output directory (find could pick up an unrelated .uf2)
+            arduino-cli compile \
+              --fqbn "$FQBN" \
+              --board-options "$OPTS" \
+              --libraries ./libraries \
+              --output-dir "$PWD/build" \
+              firmware/pico_switch_pad
+            COUNT=$(ls -1 build/*.uf2 2>/dev/null | wc -l)
+            if [ "$COUNT" -ne 1 ]; then
+              echo "Expected exactly 1 UF2 in build/, found $COUNT"; ls -la build || true; exit 1
+            fi
+            mv build/*.uf2 "$OUT"
+            echo "::endgroup::"
+          }
+
+          # The Wi-Fi country code is not fixed at build time: the country setting in
+          # link.cfg applies it at runtime (default worldwide), covering both
+          # international distribution and ch12/13 in Japan. ipbtstack=ipv4btcble
+          # enables BTstack (BLE); both transports are linked in because mode in
+          # link.cfg picks the active one at runtime.
+          # FS is 512KB on both boards: 8 dongle-macro slots x 34KB plus link.cfg,
+          # with room left for LittleFS wear leveling. Same size on both so slot
+          # capacity does not differ per board.
+          build_one rp2040:rp2040:rpipicow \
+            "usbstack=tinyusb,flash=2097152_524288,ipbtstack=ipv4btcble" \
+            karakuri-firmware-picow.uf2
+
+          build_one rp2040:rp2040:rpipico2w \
+            "usbstack=tinyusb,flash=4194304_524288,arch=arm,ipbtstack=ipv4btcble" \
+            karakuri-firmware-pico2w.uf2
+
+          ls -la karakuri-firmware*.uf2
+
+      - name: Create and push tag
+        run: |
+          TAG=${{ steps.version.outputs.tag }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Commit the generated version.h and tag that commit. Otherwise the source a
+          # tag points at would still carry FW_VERSION "dev" and the release could not
+          # be reproduced. We never push to main, so this workflow cannot re-trigger itself.
+          git add firmware/pico_switch_pad/version.h
+          git commit -m "build: FW_VERSION ${{ steps.version.outputs.version }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Upload UF2 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: karakuri-firmware
+          path: |
+            karakuri-firmware-picow.uf2
+            karakuri-firmware-pico2w.uf2
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          files: |
+            karakuri-firmware-picow.uf2
+            karakuri-firmware-pico2w.uf2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
