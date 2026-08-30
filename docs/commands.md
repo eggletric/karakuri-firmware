@@ -47,6 +47,11 @@ Switch 1 generation and Joy-Cons are not).
 Dongle mode has no link to the app; configuration is over USB serial only. Put the
 Pro Controller 2 into pairing mode with its sync button and it connects automatically;
 on disconnect the firmware sends a neutral state and rescans.
+The **USB controller stays present on the host across a Pro Controller 2 disconnect**:
+the report stream keeps running (as a neutral controller) through the rescan and the
+reconnect handshake, so a console does not drop the pad and the controller is live
+again the moment the Pro Controller 2 comes back. Unplug the USB cable to make it go
+away.
 A change to `usbmode` takes effect via the automatic reboot on `RESET`.
 Logs appear on serial under the `[DONGLE]` tag.
 
@@ -169,15 +174,18 @@ Up to 8 recordings are kept on flash. Everything is driven from the controller i
 | then: slot button | save to that slot (double vibration), resume relaying |
 | then: C | discard (one long vibration), resume relaying |
 | while playing: C | stop playback |
+| C + GL + GR held for 1s | a separate, longer vibration = GL/GR assignment mode (see below) |
 
 Slot buttons: **A, B, X, Y, L, R, ZL, ZR** (8 slots). GL/GR are not slots — they are
 the record trigger — and keep passing through as normal buttons.
 
 Details:
 
-- **C never reaches the host while macro=on** (it is the control button). The C
-  assignment in `ds4map` / `switchmap` is effectively inert while macro=on; the GL/GR
-  assignments stay active. On ds4 the touchpad click is still available through CAPTURE
+- **C never reaches the host while macro=on** (it is the control button), and neither
+  do **GL/GR while C is held** (every C+paddle combination is a control gesture, so a
+  held paddle must not fire in-game during the 1s hold). The C assignment in
+  `ds4map` / `switchmap` is effectively inert while macro=on. On ds4 the touchpad
+  click is still available through CAPTURE
 - For **slot playback** C must be pressed first: only a slot button pressed while C is
   already held counts, so pressing C while holding e.g. ZR in-game cannot hijack into
   playback. The **record trigger is order-independent** (the back paddles are naturally
@@ -198,6 +206,56 @@ Details:
 
 ---
 
+## GL/GR button assignment
+
+The two back paddles can be assigned any combination of buttons, so a single paddle
+can fire several at once (for example GL = A + UP). The assignment is one
+**mode-independent** value per paddle: the same setting applies to every `usbmode`,
+because it is stored as a controller-level button mask and converted by each USB
+identity with its own existing logic.
+
+Set it two ways — both write the same value, so the last write wins:
+
+- **From the app / serial**: `glmap=` / `grmap=` (see Configuration below)
+- **From the controller**, with `macro=on` (the gesture needs C as a control button):
+
+| Step | Action | Feedback |
+|---|---|---|
+| 1 | Hold **C + GL + GR** for 1s | one **long** vibration (clearly longer than any recorder buzz) |
+| 2 | Release everything | selection mode starts 0.5s later; the host sees neutral from here on |
+| 3 | Hold the button(s) to assign for **3s** without changing them | double vibration = captured |
+| 4 | Release everything, then press **GL** or **GR** | vibration = saved to that paddle |
+
+- Assignable buttons, by gesture and from the app alike: **dpad up/down/left/right,
+  A, B, X, Y, L, R, ZL, ZR, Lstick-click, Rstick-click** (14). C, GL and GR are control
+  buttons, and the system buttons (`+`, `-`, HOME, CAPTURE) are deliberately left out so
+  a paddle can never fire something that leaves the game. They are ignored during
+  selection and rejected by `glmap=` / `grmap=`
+- Releasing a button or adding another **restarts the 3s count**. Releasing everything
+  just stops the count — selection mode stays active
+- **C cancels** at any point during the gesture (one long vibration, nothing saved).
+  This is why C itself can never be assigned
+- **To clear an assignment**: in selection mode, with nothing held, press GL or GR
+  directly. That paddle goes back to its default behavior. Selection only begins
+  0.5s after a clean full release (pressing anything restarts that wait), so a
+  paddle still bouncing from the trigger grip cannot clear an assignment by accident
+- 15s without any button activity aborts the gesture (triple vibration)
+- The result is saved to flash immediately — no `RESET` or reboot needed
+
+Precedence, per paddle independently:
+
+- **assignment set** → it replaces the paddle entirely: the `ds4map`/`switchmap` token
+  for that paddle and the native sinput paddle bit are both overridden
+- **assignment not set** (the default) → unchanged legacy behavior: sinput forwards the
+  native paddle bit, ds4/switch/procon apply their `ds4map`/`switchmap` token
+
+Assignments apply **regardless of `macro`** — only the on-controller gesture for
+*setting* them needs `macro=on`. Macro playback goes through the same conversion, so a
+recording that contains paddle presses follows whatever assignment is current at
+playback time. `DMACRO` prints the current assignments.
+
+---
+
 ## Configuration (USB serial only)
 
 ```
@@ -209,9 +267,18 @@ usbmode=<sinput|ds4|switch|procon>  USB identity in dongle mode (default sinput)
 ds4map=<c>,<gl>,<gr>    C/GL/GR assignments in ds4 mode. Tokens:
                         none/touchpad/ps/share/options/l1/r1/l2/r2/l3/r3/
                         cross/circle/square/triangle (default touchpad,none,none)
+                        The GL/GR halves are overridden when glmap/grmap is set
 switchmap=<c>,<gl>,<gr> C/GL/GR assignments in switch and procon modes. Tokens:
                         none/a/b/x/y/l/r/zl/zr/plus/minus/home/capture/
                         lstick/rstick (default none,none,none)
+                        The GL/GR halves are overridden when glmap/grmap is set
+glmap=<tokens>          GL assignment, applied in every usbmode. Combine with '+'
+grmap=<tokens>          GR assignment, same syntax. Tokens:
+                        none/up/down/left/right/a/b/x/y/l/r/zl/zr/
+                        lstick/rstick (default none)
+                        e.g. glmap=a+up   grmap=none   (none clears it)
+                        An unknown token rejects the whole line, keeping the
+                        previous value (a typo cannot save a half-built combo)
 macro=<on|off>          dongle macro recorder (default off; mode=dongle only)
 ssid=<SSID>             the Wi-Fi keys below are required only when mode=wifi
 pass=<PASSWORD>         leading and trailing spaces are NOT trimmed
@@ -222,7 +289,8 @@ sn=<IPv4>
 CFG END                 validate and save to /link.cfg
 
 RESET                   reload link.cfg and apply it
-DMACRO                  dongle macro recorder status (state and slot occupancy)
+DMACRO                  dongle macro recorder status (state, slot occupancy,
+                        and the current glmap/grmap assignments)
 FS INFO                 LittleFS status and whether link.cfg exists
 FS TEST                 read/write test
 FS FORMAT               format LittleFS (this erases the configuration too)

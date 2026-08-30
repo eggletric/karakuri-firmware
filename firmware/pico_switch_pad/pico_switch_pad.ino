@@ -37,13 +37,18 @@ struct LinkConfig {
   String swMapC;     // token assigned to the C button in switch mode
   String swMapGL;    // same for GL in switch mode
   String swMapGR;    // same for GR in switch mode
+  // Mode-independent GL/GR assignment: a P2_BTN_* bitmask injected in place of the
+  // paddle bit (so combos are possible). Non-zero overrides the ds4map/switchmap
+  // token and the native sinput paddle bit; 0 means "no remap" = legacy behavior.
+  uint32_t glMask;
+  uint32_t grMask;
   bool macroOn;      // dongle macro recorder (record/replay controller input; mode=dongle only)
   bool valid;        // whether the Wi-Fi fields are complete (required only when mode=wifi)
 };
 
 LinkConfig gLinkConfig = {
   "bt", "", "", "", IPAddress(), "", IPAddress(), IPAddress(),
-  "sinput", "touchpad", "none", "none", "none", "none", "none", false, false
+  "sinput", "touchpad", "none", "none", "none", "none", "none", 0, 0, false, false
 };
 bool wifiStarted  = false;
 bool gWifiEnabled = false;   // whether we intend to use Wi-Fi (gates automatic reconnection)
@@ -130,6 +135,74 @@ String normalizeSwitchToken(const String &m, const char *fallback) {
   v.trim();
   v.toLowerCase();
   return isValidSwitchToken(v) ? v : String(fallback);
+}
+
+// ---- GL/GR assignment masks (glmap= / grmap=) ----
+// The assignment is stored as a raw P2_BTN_* mask and injected into the report
+// before conversion, so every USB identity converts it with its own existing
+// logic (the DS4 hat, the L2/R2 analog values, the procon dpad bits, ...).
+
+// Everything a paddle may be assigned to, from the app and from the on-controller
+// gesture alike. C/GL/GR are control buttons and a paddle cannot be mapped to itself;
+// the system buttons (+/-/HOME/CAPTURE) are left out on purpose, so that a paddle can
+// never fire something that leaves the game or opens a console overlay.
+const uint32_t GLGR_ASSIGNABLE_MASK =
+    P2_BTN_UP | P2_BTN_DOWN | P2_BTN_LEFT | P2_BTN_RIGHT |
+    P2_BTN_A | P2_BTN_B | P2_BTN_X | P2_BTN_Y |
+    P2_BTN_L | P2_BTN_R | P2_BTN_ZL | P2_BTN_ZR |
+    P2_BTN_LSTICK | P2_BTN_RSTICK;
+
+struct GlgrToken {
+  const char *name;
+  uint32_t    mask;
+};
+// Canonical order: also the order glgrMaskToTokens prints in
+const GlgrToken GLGR_TOKENS[] = {
+  { "up", P2_BTN_UP }, { "down", P2_BTN_DOWN },
+  { "left", P2_BTN_LEFT }, { "right", P2_BTN_RIGHT },
+  { "a", P2_BTN_A }, { "b", P2_BTN_B }, { "x", P2_BTN_X }, { "y", P2_BTN_Y },
+  { "l", P2_BTN_L }, { "r", P2_BTN_R }, { "zl", P2_BTN_ZL }, { "zr", P2_BTN_ZR },
+  { "lstick", P2_BTN_LSTICK }, { "rstick", P2_BTN_RSTICK },
+};
+const uint8_t GLGR_TOKEN_COUNT = sizeof(GLGR_TOKENS) / sizeof(GLGR_TOKENS[0]);
+
+// "a+up" -> mask. "none" / empty -> 0. An unknown token fails the WHOLE line
+// (ok=false): a typo must never save a half-built combo.
+uint32_t glgrTokensToMask(const String &in, bool &ok) {
+  ok = true;
+  String v = in;
+  v.trim();
+  v.toLowerCase();
+  if (v.length() == 0 || v == "none") return 0;
+
+  uint32_t mask = 0;
+  int start = 0;
+  while (start <= (int)v.length()) {
+    int plus = v.indexOf('+', start);
+    String tok = (plus >= 0) ? v.substring(start, plus) : v.substring(start);
+    tok.trim();
+    if (tok.length() == 0) { ok = false; return 0; }   // "a++b" / trailing '+'
+    bool found = false;
+    for (uint8_t i = 0; i < GLGR_TOKEN_COUNT; i++) {
+      if (tok == GLGR_TOKENS[i].name) { mask |= GLGR_TOKENS[i].mask; found = true; break; }
+    }
+    if (!found) { ok = false; return 0; }
+    if (plus < 0) break;
+    start = plus + 1;
+  }
+  return mask & GLGR_ASSIGNABLE_MASK;
+}
+
+String glgrMaskToTokens(uint32_t mask) {
+  mask &= GLGR_ASSIGNABLE_MASK;
+  if (!mask) return "none";
+  String out;
+  for (uint8_t i = 0; i < GLGR_TOKEN_COUNT; i++) {
+    if (!(mask & GLGR_TOKENS[i].mask)) continue;
+    if (out.length()) out += '+';
+    out += GLGR_TOKENS[i].name;
+  }
+  return out;
 }
 
 String defaultBleName() {
@@ -228,6 +301,8 @@ bool parseTcpPort(const String &s, uint16_t &out) {
 //  10: ds4map (the c,gl,gr tokens, comma-separated)
 //  11: macro ("on" | "off")              NOTE: the dongle macro recorder
 //  12: switchmap (the c,gl,gr tokens for usbmode=switch, comma-separated)
+//  13: glmask,grmask (8-digit hex P2_BTN_* masks)   NOTE: an older file without it
+//      means both are 0, i.e. GL/GR keep following ds4map / switchmap
 // ==============================
 // Returns whether the Wi-Fi fields are valid. mode/btname are applied as far as the
 // file could be read (BT runs on its defaults even with no file).
@@ -243,6 +318,8 @@ bool loadLinkConfig() {
   gLinkConfig.swMapC   = "none";
   gLinkConfig.swMapGL  = "none";
   gLinkConfig.swMapGR  = "none";
+  gLinkConfig.glMask   = 0;
+  gLinkConfig.grMask   = 0;
   gLinkConfig.macroOn  = false;
 
   if (!ensureFS()) {
@@ -279,6 +356,7 @@ bool loadLinkConfig() {
   String d4m  = f.readStringUntil('\n'); d4m.trim();
   String mac  = f.readStringUntil('\n'); mac.trim();
   String swm  = f.readStringUntil('\n'); swm.trim();
+  String gmk  = f.readStringUntil('\n'); gmk.trim();
   f.close();
 
   gLinkConfig.mode    = normalizeMode(mode);
@@ -310,6 +388,20 @@ bool loadLinkConfig() {
     gLinkConfig.swMapC  = normalizeSwitchToken(tc, "none");
     gLinkConfig.swMapGL = normalizeSwitchToken(tgl, "none");
     gLinkConfig.swMapGR = normalizeSwitchToken(tgr, "none");
+  }
+
+  // glmask,grmask as hex. A missing line (an older file) or anything unparseable
+  // leaves both at 0, which is exactly "GL/GR follow ds4map / switchmap".
+  {
+    int c1 = gmk.indexOf(',');
+    if (c1 >= 0) {
+      String a = gmk.substring(0, c1);   a.trim();
+      String b = gmk.substring(c1 + 1);  b.trim();
+      if (a.length() && b.length()) {
+        gLinkConfig.glMask = (uint32_t)strtoul(a.c_str(), nullptr, 16) & GLGR_ASSIGNABLE_MASK;
+        gLinkConfig.grMask = (uint32_t)strtoul(b.c_str(), nullptr, 16) & GLGR_ASSIGNABLE_MASK;
+      }
+    }
   }
 
   // BT mode never uses the Wi-Fi settings. Printing them looks like an attempt to
@@ -399,6 +491,13 @@ bool saveLinkConfig(const LinkConfig &cfg) {
   ok &= f.println(normalizeSwitchToken(cfg.swMapC, "none") + "," +
                   normalizeSwitchToken(cfg.swMapGL, "none") + "," +
                   normalizeSwitchToken(cfg.swMapGR, "none")) > 0;
+  {
+    char buf[20];
+    snprintf(buf, sizeof(buf), "%08lx,%08lx",
+             (unsigned long)(cfg.glMask & GLGR_ASSIGNABLE_MASK),
+             (unsigned long)(cfg.grMask & GLGR_ASSIGNABLE_MASK));
+    ok &= f.println(buf) > 0;
+  }
   if (ok && f.getWriteError()) ok = false;
   f.close();
 
@@ -592,6 +691,9 @@ bool startBleFromConfig() {
 bool startDongleFromConfig() {
   Serial.println("[DONGLE] starting BLE central (Pro Controller 2 -> USB bridge)");
   BLE.begin();   // central role. No name and no advertising needed
+  // Keep the USB report stream running through the scan and init waits, so the host
+  // keeps its controller while the Pro Controller 2 is disconnected
+  gProcon2.setPump(donglePumpUsb);
   gDongleNextScan = millis() + 500;
   Serial.println("[DONGLE] scanning for Pro Controller 2 (press sync button to pair)");
   return true;
@@ -935,6 +1037,10 @@ void handleConfigCommand(const String &line) {
       Serial.print(gLinkConfig.swMapC); Serial.print(",");
       Serial.print(gLinkConfig.swMapGL); Serial.print(",");
       Serial.println(gLinkConfig.swMapGR);
+      // The GL/GR masks override the ds4map/switchmap GL/GR tokens when non-zero.
+      // The app uses the presence of these lines to detect feature support.
+      Serial.print("glmap="); Serial.println(glgrMaskToTokens(gLinkConfig.glMask));
+      Serial.print("grmap="); Serial.println(glgrMaskToTokens(gLinkConfig.grMask));
       Serial.print("macro="); Serial.println(gLinkConfig.macroOn ? "on" : "off");
     }
     if (gLinkConfig.mode == "wifi") {
@@ -1107,6 +1213,19 @@ void handleConfigCommand(const String &line) {
     Serial.print(incomingCfg.swMapC); Serial.print(",");
     Serial.print(incomingCfg.swMapGL); Serial.print(",");
     Serial.println(incomingCfg.swMapGR);
+  } else if (line.startsWith("glmap=") || line.startsWith("grmap=")) {
+    const bool isGl = line.startsWith("glmap=");
+    bool ok = false;
+    uint32_t mask = glgrTokensToMask(line.substring(6), ok);
+    if (!ok) {
+      // Keep the previous value: a typo must not save a partially parsed combo
+      Serial.print("[CFG] "); Serial.print(isGl ? "glmap" : "grmap");
+      Serial.print(" parse error: "); Serial.println(line.substring(6));
+    } else {
+      if (isGl) incomingCfg.glMask = mask; else incomingCfg.grMask = mask;
+      Serial.print("[CFG] "); Serial.print(isGl ? "glmap=" : "grmap=");
+      Serial.println(glgrMaskToTokens(mask));
+    }
   } else if (line.startsWith("macro=")) {
     String v = line.substring(6);
     v.trim();
@@ -2237,6 +2356,22 @@ void dongleUsbTask() {
   // usbmode=switch needs nothing here: processHidAndMacroTask runs Gamepad.loop()
 }
 
+// Registered with Procon2Link as its pump: it runs during the BLE scan window and
+// the init sequence, which together used to stall loop() for seconds at a time.
+// Nothing tears the USB device down when the controller goes away, but every
+// identity streams reports on a timer (procon 8ms, ds4 4ms, sinput per loop,
+// switch 1ms), and a console drops a gamepad whose stream stops -- which is why
+// the controller used to disappear from the Switch on a Pro Controller 2
+// disconnect. Keeping these two calls alive keeps the host's controller alive.
+// Deliberately does NOT pump serial or the macro engine: handleCommand can reboot
+// the board (RESET), and re-entering it from inside a scan would be a nasty
+// surprise. Serial merely lags, because the CDC driver buffers whole lines.
+void donglePumpUsb() {
+  dongleUsbTask();
+  // usbmode=switch sends through the Gamepad instance instead
+  if (G_usb_hid.isValid() && Gamepad.ready()) Gamepad.loop();
+}
+
 // Persists the procon-identity USB trace to /ptrace.log so a failure against a real
 // console can be read back over serial afterwards (the PTRACE command; during the
 // failing session the USB host is the console itself, so the trace has to survive
@@ -2324,7 +2459,22 @@ void dongleSendNeutral() {
   }
 }
 
-void dongleApplyReport(const Procon2Report &r) {
+void dongleApplyReport(const Procon2Report &in) {
+  // GL/GR assignment: swap the paddle bit for its assigned mask before any
+  // identity-specific conversion runs. Every converter derives its output from
+  // this raw mask, so the DS4 hat, the L2/R2 analog values and the procon dpad
+  // bits all fall out of the existing code with no per-identity work.
+  // A zero mask leaves the paddle bit alone = the legacy ds4map/switchmap path.
+  // This is also the single choke point macro playback goes through, so replays
+  // follow whatever assignment is current at playback time.
+  Procon2Report r = in;
+  if (gLinkConfig.glMask && (r.buttons & P2_BTN_GL)) {
+    r.buttons = (r.buttons & ~P2_BTN_GL) | gLinkConfig.glMask;
+  }
+  if (gLinkConfig.grMask && (r.buttons & P2_BTN_GR)) {
+    r.buttons = (r.buttons & ~P2_BTN_GR) | gLinkConfig.grMask;
+  }
+
   if (gDS4) {
     DS4State s;
     buildDS4FromProcon2(r, s);
@@ -2391,6 +2541,8 @@ bool dongleRumbleActive() {
 //   while recording: C, or 90 seconds  -> stop (host output goes neutral)
 //   then: slot button = save / C = discard; resumes relaying once all buttons are up
 //   while playing: C stops (live input is otherwise not forwarded)
+//   C+GL+GR held for 1s                -> GL/GR assignment mode (see the DM_ASSIGN_*
+//                                         states below); a separate, longer buzz
 // ==============================
 struct DongleMacroSample {
   uint32_t buttons;          // P2_BTN_* bitmask (raw)
@@ -2404,6 +2556,16 @@ const uint32_t DM_ARM_HOLD_MS = 1000;       // how long C+GL/GR must be held to 
 const uint32_t DM_START_DELAY_MS = 500;     // pause between releasing everything and recording
 const uint8_t  DM_SLOT_COUNT  = 8;
 const uint32_t DM_FILE_MAGIC  = 0x314D444B; // "KDM1" little-endian
+const uint32_t DM_ASSIGN_HOLD_MS    = 3000;  // how long a selection must be held still
+const uint32_t DM_ASSIGN_TIMEOUT_MS = 15000; // inactivity abort for the assignment states
+// Settle window after the trigger release, before selection accepts input. The
+// fingers are still on the paddles at that moment, so a bounce would otherwise
+// land as the "paddle with nothing selected" clear gesture and silently wipe an
+// assignment. Same idea as DM_START_DELAY_MS on the recording path.
+const uint32_t DM_ASSIGN_SETTLE_MS  = 500;
+
+// The gesture offers exactly what the app does (see GLGR_ASSIGNABLE_MASK)
+const uint32_t DM_ASSIGN_CANDIDATE_MASK = GLGR_ASSIGNABLE_MASK;
 
 // Recording/playback buffer: reuses macroLines (45KB). Safe because the string-macro
 // engine cannot run in dongle mode (Gamepad is never begun) and the active transport
@@ -2432,11 +2594,25 @@ enum DmState : uint8_t {
   DM_SLOT_WAIT,      // recording ended; host gets neutral until save (slot) / discard (C)
   DM_RELEASE_WAIT,   // neutral until all buttons are up (so the choice never leaks to the host)
   DM_PLAYING,        // replaying a slot in a loop; live input is ignored except C (stop)
+  DM_ASSIGN_CLEARWAIT, // assignment triggered; C+GL+GR still held, wait for a full release
+  DM_ASSIGN_SELECT,    // pick the buttons to assign (3s still hold); also hosts the clear gesture
+  DM_ASSIGN_TARGET,    // selection captured; wait for a full release, then GL/GR picks the side
 };
 DmState  gDmState       = DM_RELAY;
 uint32_t gDmPrevButtons = 0;
-uint32_t gDmArmMask     = 0;   // GL or GR while the long-press timer runs (0 = none)
+// Which C combo is currently a long-press candidate: 0 none / 1 C+GL / 2 C+GR /
+// 3 C+GL+GR (assignment). Replaces the old single-paddle arm mask so the
+// three-button gesture can take priority over the two-button one.
+uint8_t  gDmComboId     = 0;
+// Once all three were seen down together, a finger slip back to two buttons must
+// not start a macro-arm candidate. Held until C, GL and GR are all released.
+bool     gDmAssignLatch = false;
 uint32_t gDmArmDeadline = 0;
+uint32_t gDmAssignPending = 0;  // candidate set captured when the 3s count completed
+uint32_t gDmAssignHeld    = 0;  // candidates held now (SELECT); release sentinel (TARGET)
+uint32_t gDmAssignCountAt = 0;  // deadline of the 3s hold (0 = not counting)
+uint32_t gDmAssignIdleAt  = 0;  // deadline of the inactivity abort
+uint32_t gDmAssignSettleAt = 0; // when selection may start (0 = not scheduled)
 uint32_t gDmStartAt     = 0;   // when armed recording actually begins (0 = not scheduled)
 uint16_t gDmCount       = 0;   // samples recorded so far
 uint16_t gDmPlayLen     = 0;
@@ -2452,6 +2628,7 @@ bool     gDmVibOn     = false;
 uint16_t gDmVibOnMs   = 0;
 uint16_t gDmVibOffMs  = 0;
 uint32_t gDmVibNextAt = 0;
+uint32_t gDmVibKeepAt = 0;   // next resend while a pulse is on (the pattern decays)
 
 bool dmVibBusy() { return gDmVibPulses > 0 || gDmVibOn; }
 
@@ -2465,18 +2642,36 @@ void dmVibrate(uint8_t pulses, uint16_t onMs, uint16_t offMs) {
 
 void dmVibService(uint32_t now) {
   if (!dmVibBusy()) return;
+
+  // A single setRumble decays on its own: the HD pattern is not sustained, and the
+  // rumble relay below already resends every 100ms for the same reason. Without
+  // this a long pulse is felt as a short tap no matter what onMs says (a 600ms
+  // buzz was indistinguishable from the 120ms one). Hold off when the pulse is
+  // about to end so this write cannot crowd the OFF write inside setRumble's 30ms
+  // spacing.
+  if (gDmVibOn && (int32_t)(now - gDmVibKeepAt) >= 0 &&
+      (int32_t)(gDmVibNextAt - now) > 50) {
+    gProcon2.setRumble(200, 200);
+    gDmVibKeepAt = now + 100;
+    gDongleLastRumbleAt = now;
+  }
+
   if ((int32_t)(now - gDmVibNextAt) < 0) return;
   // Pulse lengths are >= 80ms, which also satisfies setRumble's 30ms write spacing
   if (!gDmVibOn) {
     gProcon2.setRumble(200, 200);
     gDmVibOn = true;
     gDmVibNextAt = now + gDmVibOnMs;
+    gDmVibKeepAt = now + 100;
   } else {
     gProcon2.setRumble(0, 0);
     gDmVibOn = false;
     gDmVibPulses--;
     gDmVibNextAt = now + gDmVibOffMs;
   }
+  // Keep the relay's spacing honest: it is skipped while a pattern plays, but it
+  // resumes the moment the pattern ends and must not write on top of this one
+  gDongleLastRumbleAt = now;
 }
 
 const char* dmSlotPath(uint8_t idx) {
@@ -2537,14 +2732,56 @@ void dmReset(const char *why) {
     Serial.printf("[DMACRO] recording discarded (%s)\n", why);
   } else if (gDmState == DM_PLAYING) {
     Serial.printf("[DMACRO] playback stopped (%s)\n", why);
+  } else if (gDmState == DM_ASSIGN_CLEARWAIT || gDmState == DM_ASSIGN_SELECT ||
+             gDmState == DM_ASSIGN_TARGET) {
+    Serial.printf("[DMAP] assignment cancelled (%s)\n", why);
   }
   gDmState       = DM_RELAY;
   gDmPrevButtons = 0;
-  gDmArmMask     = 0;
+  gDmComboId     = 0;
+  gDmAssignLatch = false;
   gDmStartAt     = 0;
   gDmHaveReport  = false;
   gDmVibPulses   = 0;
   gDmVibOn       = false;
+  gDmAssignPending = 0;
+  gDmAssignHeld    = 0;
+  gDmAssignCountAt = 0;
+  gDmAssignIdleAt  = 0;
+  gDmAssignSettleAt = 0;
+}
+
+// States in which the firmware owns the controller's actuator (its vibration is
+// the only feedback channel there) and host rumble must be discarded, not queued
+bool dmOwnsActuator() {
+  return gDmState == DM_RECORDING || gDmState == DM_PLAYING ||
+         gDmState == DM_ASSIGN_CLEARWAIT || gDmState == DM_ASSIGN_SELECT ||
+         gDmState == DM_ASSIGN_TARGET;
+}
+
+// ---- GL/GR assignment gesture helpers ----
+
+void dmAssignCancel(const char *why) {
+  dmVibrate(1, 400, 80);
+  gDmState = DM_RELEASE_WAIT;
+  Serial.printf("[DMAP] cancelled (%s)\n", why);
+}
+
+// The caller has already written the new value into gLinkConfig. The host output
+// is neutral here and no recording is running, so the flash write cannot disturb
+// live input (same reasoning as dmSaveSlot).
+void dmAssignCommit(bool isGl, uint32_t mask) {
+  bool saved = saveLinkConfig(gLinkConfig);
+  if (saved) {
+    dmVibrate(1, 120, 80);
+  } else {
+    // The assignment still applies in RAM until the next reboot
+    dmVibrate(3, 80, 80);
+    Serial.println("[DMAP] save FAILED (applied in RAM only)");
+  }
+  gDmState = DM_RELEASE_WAIT;
+  Serial.printf("[DMAP] %s = %s\n", isGl ? "GL" : "GR",
+                glgrMaskToTokens(mask).c_str());
 }
 
 void dmStartRecording() {
@@ -2599,15 +2836,24 @@ bool dmHandleReport(const Procon2Report &r) {
       // gesture fail on real hardware. The 1s hold starts once both are down, and
       // the candidate dies the moment either is released. Holding C itself for a
       // full second has no other meaning, so this cannot misfire during play.
+      // C+GL+GR (id 3) is the GL/GR assignment gesture and outranks the single
+      // paddle: adding the second paddle to an in-flight arm hold upgrades the
+      // candidate and restarts the timer. gDmAssignLatch then keeps a momentary
+      // paddle bounce during that hold from falling back into a macro-arm.
       {
-        uint32_t comboMask = 0;
+        uint8_t combo = 0;
         if (btns & P2_BTN_C) {
-          if (btns & P2_BTN_GL) comboMask = P2_BTN_GL;
-          else if (btns & P2_BTN_GR) comboMask = P2_BTN_GR;
+          const bool gl = (btns & P2_BTN_GL) != 0;
+          const bool gr = (btns & P2_BTN_GR) != 0;
+          if (gl && gr)                   combo = 3;
+          else if (gl && !gDmAssignLatch) combo = 1;
+          else if (gr && !gDmAssignLatch) combo = 2;
         }
-        if (comboMask != gDmArmMask) {
-          gDmArmMask = comboMask;
-          if (comboMask) gDmArmDeadline = millis() + DM_ARM_HOLD_MS;
+        if (combo == 3) gDmAssignLatch = true;
+        if (!(btns & (P2_BTN_C | P2_BTN_GL | P2_BTN_GR))) gDmAssignLatch = false;
+        if (combo != gDmComboId) {
+          gDmComboId = combo;
+          if (combo) gDmArmDeadline = millis() + DM_ARM_HOLD_MS;
         }
       }
       // Slot playback stays strictly C-first: only a slot button pressed while C
@@ -2680,6 +2926,79 @@ bool dmHandleReport(const Procon2Report &r) {
         Serial.println("[DMACRO] playback stopped");
       }
       break;
+
+    // ---- GL/GR assignment gesture ----
+    // The host stays neutral through all three states (dongleSendNeutral() ran on
+    // entry and nothing is forwarded until DM_RELEASE_WAIT hands back to DM_RELAY),
+    // so a 3-second button hold never leaks into the game.
+
+    case DM_ASSIGN_CLEARWAIT:
+      // C+GL+GR are still down from the trigger. Selection cannot start until they
+      // are gone (or the held C would instantly cancel and the held paddles would
+      // be mistaken for a selection) AND have stayed gone for the settle window:
+      // the fingers are still on the paddles here, and a bounce would land as the
+      // "paddle with nothing selected" clear gesture. Pressing anything restarts
+      // the wait, so the delay always runs from a clean full release.
+      // dmService performs the transition once the deadline passes.
+      forward = false;
+      if (btns != 0) gDmAssignSettleAt = 0;
+      else if (gDmAssignSettleAt == 0) gDmAssignSettleAt = millis() + DM_ASSIGN_SETTLE_MS;
+      break;
+
+    case DM_ASSIGN_SELECT: {
+      forward = false;
+      if (newly & P2_BTN_C) {   // this is why C itself can never be assigned
+        dmAssignCancel("C");
+        break;
+      }
+      const uint32_t held = btns & DM_ASSIGN_CANDIDATE_MASK;
+      if (held == 0 && (newly & (P2_BTN_GL | P2_BTN_GR))) {
+        // Clear gesture: a paddle pressed with nothing selected wipes its
+        // assignment. This is the only way to undo one from the controller.
+        const bool isGl = (newly & P2_BTN_GL) != 0;
+        if (isGl) gLinkConfig.glMask = 0; else gLinkConfig.grMask = 0;
+        dmAssignCommit(isGl, 0);
+        break;
+      }
+      if (held != gDmAssignHeld) {
+        // A button released or added restarts the count; an empty set stops it
+        gDmAssignHeld    = held;
+        gDmAssignCountAt = held ? (millis() + DM_ASSIGN_HOLD_MS) : 0;
+      }
+      // A paddle pressed while candidates are held counts as "another button
+      // added": restart rather than silently ignore it
+      if ((newly & (P2_BTN_GL | P2_BTN_GR)) && held) {
+        gDmAssignCountAt = millis() + DM_ASSIGN_HOLD_MS;
+      }
+      break;
+    }
+
+    case DM_ASSIGN_TARGET:
+      forward = false;
+      if (newly & P2_BTN_C) {
+        dmAssignCancel("C");
+        break;
+      }
+      // gDmAssignHeld is a sentinel here: 1 until the selection has been fully
+      // released once, so a still-held ZR/L cannot be taken as the target press
+      if (btns == 0) {
+        gDmAssignHeld = 0;
+        break;
+      }
+      if (gDmAssignHeld == 0 && (newly & (P2_BTN_GL | P2_BTN_GR))) {
+        const bool isGl = (newly & P2_BTN_GL) != 0;   // GL wins if both arrive at once
+        if (isGl) gLinkConfig.glMask = gDmAssignPending;
+        else      gLinkConfig.grMask = gDmAssignPending;
+        dmAssignCommit(isGl, gDmAssignPending);
+      }
+      // anything else pressed while waiting for the target is ignored
+      break;
+  }
+
+  // Any button activity keeps the assignment states alive
+  if (gDmState == DM_ASSIGN_CLEARWAIT || gDmState == DM_ASSIGN_SELECT ||
+      gDmState == DM_ASSIGN_TARGET) {
+    if (btns != gDmPrevButtons) gDmAssignIdleAt = millis() + DM_ASSIGN_TIMEOUT_MS;
   }
 
   gDmPrevButtons = btns;
@@ -2699,12 +3018,62 @@ void dmService() {
     return;
   }
 
-  if (gDmState == DM_RELAY && gDmArmMask && (int32_t)(now - gDmArmDeadline) >= 0) {
-    gDmState   = DM_ARMED;
-    gDmArmMask = 0;
-    gDmStartAt = 0;
-    dmVibrate(1, 120, 80);
-    Serial.println("[DMACRO] armed: release all buttons to start recording");
+  if (gDmState == DM_RELAY && gDmComboId && (int32_t)(now - gDmArmDeadline) >= 0) {
+    if (gDmComboId == 3) {
+      // C+GL+GR: GL/GR assignment. The long buzz is deliberately much longer
+      // than every recorder pattern so the two gestures cannot be confused.
+      gDmState          = DM_ASSIGN_CLEARWAIT;
+      gDmAssignIdleAt   = now + DM_ASSIGN_TIMEOUT_MS;
+      gDmAssignSettleAt = 0;   // the settle only starts once everything is released
+      dongleSendNeutral();
+      // One long continuous buzz, an order of magnitude longer than the recorder's
+      // 120ms tap, so the two gestures cannot be confused by feel. This only lasts
+      // because dmVibService resends during the pulse
+      dmVibrate(1, 1000, 80);
+      Serial.println("[DMAP] assignment mode: release all buttons");
+    } else {
+      gDmState   = DM_ARMED;
+      gDmStartAt = 0;
+      dmVibrate(1, 120, 80);
+      Serial.println("[DMACRO] armed: release all buttons to start recording");
+    }
+    gDmComboId = 0;
+  }
+
+  // Trigger fully released and settled: selection can now accept input. Done here
+  // (not in dmHandleReport) because the settle expires on a timer, and a
+  // motionless controller sends nothing to expire it on.
+  if (gDmState == DM_ASSIGN_CLEARWAIT && gDmAssignSettleAt &&
+      (int32_t)(now - gDmAssignSettleAt) >= 0) {
+    gDmState         = DM_ASSIGN_SELECT;
+    gDmAssignHeld    = 0;
+    gDmAssignCountAt = 0;
+    gDmAssignSettleAt = 0;
+    gDmAssignIdleAt  = now + DM_ASSIGN_TIMEOUT_MS;
+    Serial.println("[DMAP] select: hold the buttons to assign for 3s (C = cancel)");
+  }
+
+  // The 3s selection hold completes without a fresh report: the user is holding
+  // still, so no notification may arrive for the whole count
+  if (gDmState == DM_ASSIGN_SELECT && gDmAssignCountAt &&
+      (int32_t)(now - gDmAssignCountAt) >= 0) {
+    gDmAssignPending = gDmAssignHeld & DM_ASSIGN_CANDIDATE_MASK;
+    gDmAssignCountAt = 0;
+    gDmAssignHeld    = 1;   // sentinel: the target press needs a full release first
+    gDmState         = DM_ASSIGN_TARGET;
+    gDmAssignIdleAt  = now + DM_ASSIGN_TIMEOUT_MS;
+    dmVibrate(2, 120, 100);
+    Serial.printf("[DMAP] captured %s: release, then press GL or GR\n",
+                  glgrMaskToTokens(gDmAssignPending).c_str());
+  }
+
+  // Inactivity abort: without it a walked-away-from gesture would hold the host
+  // at neutral forever
+  if ((gDmState == DM_ASSIGN_CLEARWAIT || gDmState == DM_ASSIGN_SELECT ||
+       gDmState == DM_ASSIGN_TARGET) && (int32_t)(now - gDmAssignIdleAt) >= 0) {
+    dmVibrate(3, 80, 80);
+    gDmState = DM_RELEASE_WAIT;
+    Serial.println("[DMAP] timed out");
   }
 
   // Armed and everything released: the 0.5s settle delay has passed -> record
@@ -2753,12 +3122,17 @@ void dmService() {
 
 // The DMACRO serial command (status for verification)
 void dmPrintStatus() {
+  // Indexed by DmState: every enum entry needs a name here
   static const char *STATE_NAMES[] = {
-    "relay", "armed", "recording", "slot-wait", "release-wait", "playing"
+    "relay", "armed", "recording", "slot-wait", "release-wait", "playing",
+    "assign-clearwait", "assign-select", "assign-target"
   };
   Serial.printf("[DMACRO] macro=%s state=%s samples=%u\n",
                 gLinkConfig.macroOn ? "on" : "off",
                 STATE_NAMES[gDmState], (unsigned)gDmCount);
+  Serial.printf("[DMACRO] glmap=%s grmap=%s\n",
+                glgrMaskToTokens(gLinkConfig.glMask).c_str(),
+                glgrMaskToTokens(gLinkConfig.grMask).c_str());
   bool fsOk = ensureFS();
   for (uint8_t i = 0; i < DM_SLOT_COUNT; i++) {
     bool saved = fsOk && LittleFS.exists(dmSlotPath(i));
@@ -2787,13 +3161,17 @@ void processDongleTask() {
       if (gDmState != DM_RELAY) dmReset("controller disconnect");
     }
 
-    // BLE.scan() blocks for 2 seconds, so leave 1 second between scans for serial
-    // configuration and the like to respond
+    // A scan takes 2 seconds. USB is pumped throughout, but serial and the rest of
+    // loop() are not, so leave a gap between scans for them to respond. The deadline
+    // is armed AFTER the scan returns: setting it before meant the gap had already
+    // elapsed by the time the 2s scan finished, so scans ran back to back and the
+    // rest of loop() got a single pass every 2 seconds.
     uint32_t now = millis();
     if ((int32_t)(now - gDongleNextScan) < 0) return;
-    gDongleNextScan = now + 1000;
 
-    if (gProcon2.scanAndConnect()) {
+    bool linked = gProcon2.scanAndConnect();
+    gDongleNextScan = millis() + 300;
+    if (linked) {
       gDongleWasConnected = true;
       dongleStartCalibration();   // re-measure the center on every connection
     }
@@ -2816,7 +3194,7 @@ void processDongleTask() {
   // would be indistinguishable from it), and during playback (the player is not
   // holding the controller as the game assumes; a buzzing idle controller is just
   // noise).
-  if (!dmVibBusy() && gDmState != DM_RECORDING && gDmState != DM_PLAYING) {
+  if (!dmVibBusy() && !dmOwnsActuator()) {
     uint8_t l, r;
     if (dongleTakeRumble(l, r)) {
       gDongleRumbleL = l;
@@ -2831,9 +3209,9 @@ void processDongleTask() {
       gDongleLastRumbleAt = now;
       gDongleRumblePending = false;
     }
-  } else if (gDmState == DM_RECORDING || gDmState == DM_PLAYING) {
-    // Discard (not defer) game rumble while recording/playing back, so a stale
-    // request cannot buzz right after the recording or playback ends
+  } else if (dmOwnsActuator()) {
+    // Discard (not defer) game rumble while recording, playing back or assigning,
+    // so a stale request cannot buzz right after the gesture ends
     uint8_t l, r;
     dongleTakeRumble(l, r);
   }
@@ -2853,6 +3231,12 @@ void processDongleTask() {
         // C is the recorder's control button and never reaches the host
         Procon2Report masked = report;
         masked.buttons &= ~P2_BTN_C;
+        // Any C+paddle combination is a control gesture (record arm / assignment),
+        // so the paddles must not reach the host during the 1s hold either —
+        // with an assignment set that would fire the assigned buttons in-game
+        if (report.buttons & P2_BTN_C) {
+          masked.buttons &= ~(P2_BTN_GL | P2_BTN_GR);
+        }
         // The IMU is relay-only and never recorded, so it is muted during recording:
         // otherwise the take would rely on gyro input that playback cannot reproduce
         if (gDmState == DM_RECORDING) {

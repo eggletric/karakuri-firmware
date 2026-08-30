@@ -13,6 +13,14 @@ extern "C" void gap_set_connection_parameters(
     uint16_t conn_scan_interval, uint16_t conn_scan_window,
     uint16_t conn_interval_min, uint16_t conn_interval_max, uint16_t conn_latency,
     uint16_t supervision_timeout, uint16_t min_ce_length, uint16_t max_ce_length);
+// BLE.scan() is only a blocking wrapper around these: btstack collects advertisements
+// asynchronously into BLEClass::_scanResults from its packet handler, and the library
+// merely starts a scan, spins in delay(), and stops it. Driving them directly lets the
+// USB report stream keep running while we look for the controller (see scanAndConnect).
+extern "C" uint8_t gap_set_scan_params(uint8_t scan_type, uint16_t scan_interval,
+                                       uint16_t scan_window, uint8_t scanning_filter_policy);
+extern "C" void gap_start_scan(void);
+extern "C" void gap_stop_scan(void);
 
 // con_handle / _valueHandle() are protected. Explicit instantiation skips access
 // checking (a loophole in the C++ standard), so this extracts them legally.
@@ -41,6 +49,14 @@ struct Procon2CharUuidTag {
     friend type procon2Steal(Procon2CharUuidTag);
 };
 template struct Procon2Rob<Procon2CharUuidTag, &BLERemoteCharacteristic::_uuid>;
+// The scan result list is private and the library exposes it only as the return value
+// of the blocking scan(), which is exactly what we cannot call. clearScan() is public,
+// so this is the one missing piece for driving a scan ourselves.
+struct Procon2ScanResultsTag {
+    typedef BLEScanReport BLEClass::*type;
+    friend type procon2Steal(Procon2ScanResultsTag);
+};
+template struct Procon2Rob<Procon2ScanResultsTag, &BLEClass::_scanResults>;
 
 // ==============================
 // Dongle mode: BLE connection to a Pro Controller 2 (Switch 2 Pro Controller)
@@ -121,6 +137,29 @@ public:
     // (subscribing, draining the ring) runs exactly as in normal operation
     inline static bool debugLog = false;
 
+    // Called instead of a bare delay() everywhere this class has to wait (the scan
+    // window and the init sequence's pacing). The dongle registers the USB report
+    // pump here so the host keeps seeing a controller while the Pro Controller 2 is
+    // away: nothing tears the USB device down on a BLE disconnect, but a console
+    // drops a gamepad that stops reporting, and these waits used to stall loop()
+    // for 2+ seconds at a time.
+    // Static like debugLog: writeToChar and friends are static, and there is only
+    // ever one link
+    typedef void (*PumpFn)();
+    inline static PumpFn _pump = nullptr;
+    static void setPump(PumpFn fn) { _pump = fn; }
+
+    // delay() on this core is sleep_ms() and does not run yield(), so the USB stack
+    // only keeps answering control transfers from its IRQ while application-level
+    // report sending stops dead. Slice the wait and pump between the slices.
+    static void pumpWait(uint32_t ms) {
+        const uint32_t start = millis();
+        while ((uint32_t)(millis() - start) < ms) {
+            if (_pump) _pump();
+            delay(1);   // also what lets the BT stack make progress, as in BLE.scan()
+        }
+    }
+
     bool connected() { return _connected && BLE.client()->connected(); }
 
     // The link is alive but notifications stopped. Callers watch this and reconnect
@@ -129,15 +168,35 @@ public:
         return _connected && (int32_t)(millis() - _lastValidReportAt) > 3000;
     }
 
-    // If not connected, scan for 2 seconds and try a matching device. BLE.scan() and
-    // the init sequence (about 1.2 seconds) both block, so callers must space out calls.
+    // Drop-in for BLE.scan(): the same btstack calls the library makes, but the wait
+    // pumps USB instead of spinning in delay(). btstack fills BLEClass::_scanResults
+    // from its packet handler either way, so the results are identical; the library's
+    // parameters (active scan, interval 100, window 99, accept all) are kept as-is.
+    BLEScanReport *scanPumping(uint32_t ms) {
+        BLE.clearScan();
+        {
+            BluetoothLock lock;
+            gap_set_scan_params(1, 100, 99, 0);
+            gap_start_scan();
+        }
+        pumpWait(ms);
+        {
+            BluetoothLock lock;
+            gap_stop_scan();
+        }
+        return &(BLE.*procon2Steal(Procon2ScanResultsTag{}));
+    }
+
+    // Scans for 2 seconds and tries a matching device. The scan window and the init
+    // sequence (about 1.2 seconds) both take real time, but they pump USB throughout
+    // (see pumpWait), so the host keeps its controller while we look.
     bool scanAndConnect() {
         // btstack defaults to a 30ms max interval with latency 4, and the controller
         // notifies once per connection event, dropping the report rate to ~32Hz.
         // Request 7.5-15ms with latency 0 (scan and supervision timeouts stay default).
         gap_set_connection_parameters(0x0060, 0x0030, 6, 12, 0, 0x0048, 0, 0);
 
-        auto report = BLE.scan(2 /*sec*/, true);
+        auto report = scanPumping(2000);
         for (auto &item : *report) {
             if (!isProcon2Advertisement(item)) continue;
 
@@ -290,7 +349,7 @@ private:
                         con, vh, len, (uint8_t *)data);
                 }
                 if (rc == 0) return true;
-                delay(5);
+                pumpWait(5);
             }
             return false;
         }
@@ -411,7 +470,9 @@ private:
             memset(pkt, 0, 33);
             memcpy(&pkt[33], CMDS[i], CMD_LENS[i]);
             if (!writeToChar(_rumble, pkt, 33 + CMD_LENS[i])) return false;
-            delay(80);
+            // 15 x 80ms = ~1.2s. Pumped, or the host would lose the controller at
+            // the very moment we are reconnecting one.
+            pumpWait(80);
             drainResponsesToSerial((int)i);
         }
         return true;
