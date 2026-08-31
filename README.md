@@ -72,7 +72,7 @@ These URLs always return the UF2 attached to the latest official release.
 - `docs/boards.md`
   - Supported boards and how to identify them in BOOTSEL mode
 - `docs/switch-limitations.md`
-  - Notes on Switch-side limitations (the HOME button and other things a firmware fix cannot solve)
+  - Notes on Switch-side limitations (waking the console from sleep and other things a firmware fix cannot solve)
 
 ## Acknowledgements
 

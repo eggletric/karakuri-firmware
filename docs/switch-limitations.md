@@ -11,52 +11,40 @@ will solve" or that "would require a structural change to solve".
 
 ---
 
-## The HOME button does not work
+## The HOME button works, but it cannot wake a sleeping Switch
 
-### The firmware sends it correctly
+The HOME button itself is fine. Once the console is awake and the pad is
+recognized, `BTN HOME DOWN` / `BTN HOME UP` opens the HOME menu as expected,
+whether it comes from a macro or from KarakuriPad's ControllerPad.
 
-- `enum NSButtons` in `switch_tinyusb.h` defines `NSButton_Home = 12`
-- The HID report descriptor declares `Report Count (14)` = button bits 0..13, so bit 12 is in range
-- `BTN HOME DOWN` → `Gamepad.press(NSButton_Home)` → `_report.buttons |= 1 << 12` is set and sent
+What does **not** work is **waking the console from sleep.** A sleeping Switch
+only wakes for controllers it treats as first-party wireless pads; it does not
+wake because a third-party USB HID device was plugged in or because that device
+started reporting a HOME press. This is a console-side rule, not something the
+firmware can send its way around.
 
-So this is **not a defect in the code**. When it does not work, the cause is one of the following.
+### Workaround: wake it with the real controller first
 
-### Cause (a) the press is too short
+Wake the Switch the normal way, then hand control over:
 
-The Switch is known to require a longer press for HOME than for other buttons.
-Macros default to a 100ms interval, so if the line after `BTN HOME DOWN` is
-immediately `BTN HOME UP`, the button is only held for 100ms.
+1. Wake the Switch with a Pro Controller connected to it directly (its own HOME button)
+2. Connect the dongle, or connect KarakuriPad and send HOME from the app
+3. From here on HOME behaves normally
 
-**Try this first. No firmware change needed.**
+There is no firmware change to make here — the split is deliberate: **use the
+normal connection to wake, use this firmware for everything after that.**
+
+### If HOME does not respond while the console is awake
+
+The likely cause is press duration. The Switch wants a longer hold for HOME
+than for other buttons, and macros default to a 100ms interval, so
+`BTN HOME DOWN` immediately followed by `BTN HOME UP` only holds it for 100ms.
 
 ```
 BTN HOME DOWN
 SLEEP 500
 BTN HOME UP
 ```
-
-If pressing it with your finger from KarakuriPad's ControllerPad does not work either,
-press duration is not the cause — go to (b).
-
-### Cause (b) the Switch drops HOME based on VID:PID
-
-The HORI Pokken Tournament Pro Pad at `0x0f0d:0x0092` **has no physical HOME button.**
-
-The Switch treats third-party wired controllers as known devices by VID:PID, so it
-does not necessarily trust the "14 buttons" descriptor we declare. Once it has
-recognized us as a Pokken Pad, it most likely discards bit 12 on the grounds that
-"this controller has no HOME".
-
-The fix to try is replacing `setID` in `switch_tinyusb.h` with the VID:PID of a
-Switch-compatible wired controller that does have HOME. **This needs no hardware
-work — only a firmware rebuild.** Expect to try several IDs on real hardware to
-find one that gets through.
-
-### Diagnostic steps
-
-1. Try the `BTN HOME DOWN` / `SLEEP 500` / `BTN HOME UP` macro
-2. If that fails, try a long press with your finger from the ControllerPad
-3. If neither works, (b) is confirmed. Try swapping `setID`
 
 ---
 
@@ -66,7 +54,8 @@ find one that gets through.
 |---|---|---|
 | Buttons, sticks, D-Pad | Yes | See the command list in `handleCommand()` |
 | Macro loop playback | Yes | Loops forever until `MACRO STOP`. Designed for unattended grinding |
-| HOME button | Partial | It is sent. Whether the console accepts it is covered above |
-| CAPTURE button | Partial | May have the same problem for the same reason as HOME |
+| HOME button | Yes | Works while the console is awake. Hold it long enough — see above |
+| CAPTURE button | Yes | Sent the same way as HOME |
+| Waking the Switch from sleep | No | Console-side rule. Wake it with a directly connected controller first |
 | Rumble (HD rumble) | No | Output reports are not handled |
 | Gyro / IMU | No | The descriptor declares no axes |
