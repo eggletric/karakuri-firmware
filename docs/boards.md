@@ -20,10 +20,14 @@ RP2040's 264KB, which leaves the RP2350 with even more headroom.
 | | Pico W | Pico 2 W |
 |---|---|---|
 | FQBN | `rp2040:rp2040:rpipicow` | `rp2040:rp2040:rpipico2w` |
-| flash | `2097152_65536` (2MB / FS 64KB) | `4194304_65536` (4MB / FS 64KB) |
+| flash | `2097152_524288` (2MB / FS 512KB) | `4194304_524288` (4MB / FS 512KB) |
 | usbstack | `tinyusb` | `tinyusb` |
+| ipbtstack | `ipv4btcble` | `ipv4btcble` |
 | arch | (unspecified) | `arm` |
 
+- **The 512KB LittleFS is what the dongle macro recorder needs.** Each of the 8 slots
+  holds up to 2880 samples x 12 bytes (about 34KB), so the slots alone come to roughly
+  280KB. The default 64KB filesystem cannot hold them
 - The platform ID stays `rp2040:rp2040` even for the RP2350 (a historical quirk of arduino-pico)
 - The Pico 2 W lets you pick ARM or RISC-V via `menu.arch`. We specify ARM explicitly
 - The matching UF2 family is `rp2350-arm-s`

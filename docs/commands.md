@@ -338,6 +338,9 @@ Tagged logs are printed to serial.
 | `[CFG]` | Reading and writing configuration |
 | `[MACRO]` | Macro loading and playback |
 | `[FS]` | LittleFS |
+| `[DONGLE]` | Dongle mode (Pro Controller 2 connect / disconnect, USB identity) |
+| `[DMACRO]` | Dongle macro recorder (arm, record, save, playback) |
+| `[DMAP]` | The on-controller GL/GR assignment gesture |
 
 While a macro is loading, a log line is printed only every 200 steps
 (printing one per line would occupy the serial port for a long time).

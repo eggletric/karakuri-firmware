@@ -9,6 +9,12 @@ That means it **only works within what the Switch itself allows a generic
 third-party HID pad to do.** This file records the things that "no firmware fix
 will solve" or that "would require a structural change to solve".
 
+**Scope: the bt / wifi modes and `usbmode=switch`,** i.e. everything that goes out
+under the HORI-compatible identity. Dongle mode's `usbmode=procon` is a different
+identity (057E:2009, the console's own protocol) and is not bound by the "generic
+HID pad" limits below — gyro and rumble do work there. See
+[`commands.md`](commands.md).
+
 ---
 
 ## The HOME button works, but it cannot wake a sleeping Switch
@@ -57,5 +63,5 @@ BTN HOME UP
 | HOME button | Yes | Works while the console is awake. Hold it long enough — see above |
 | CAPTURE button | Yes | Sent the same way as HOME |
 | Waking the Switch from sleep | No | Console-side rule. Wake it with a directly connected controller first |
-| Rumble (HD rumble) | No | Output reports are not handled |
-| Gyro / IMU | No | The descriptor declares no axes |
+| Rumble (HD rumble) | No | Output reports are not handled. Dongle `usbmode=procon` does support it |
+| Gyro / IMU | No | The descriptor declares no axes. Dongle `usbmode=procon` does support it |
