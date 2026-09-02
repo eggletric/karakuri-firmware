@@ -1,5 +1,2 @@
-// firmware/pico_switch_pad/version.h
 #pragma once
-
-// GitHub Actions rewrites this line
-#define FW_VERSION "dev"
+#define FW_VERSION "0.0.3"
