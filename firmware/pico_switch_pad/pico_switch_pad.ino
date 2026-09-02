@@ -32,14 +32,11 @@ struct LinkConfig {
   IPAddress subnet;
   String usbMode;    // USB identity in dongle mode: "sinput" (default) | "ds4" | "switch" | "procon"
   String ds4MapC;    // token assigned to the C button in ds4 mode
-  String ds4MapGL;   // same for GL in ds4 mode
-  String ds4MapGR;   // same for GR in ds4 mode
-  String swMapC;     // token assigned to the C button in switch mode
-  String swMapGL;    // same for GL in switch mode
-  String swMapGR;    // same for GR in switch mode
+  String swMapC;     // token assigned to the C button in switch and procon modes
   // Mode-independent GL/GR assignment: a P2_BTN_* bitmask injected in place of the
-  // paddle bit (so combos are possible). Non-zero overrides the ds4map/switchmap
-  // token and the native sinput paddle bit; 0 means "no remap" = legacy behavior.
+  // paddle bit (so combos are possible). Non-zero overrides the native sinput paddle
+  // bit; 0 means "no remap" (sinput forwards the paddle bit, the other identities
+  // have nothing to put it on, so the paddle does nothing there).
   uint32_t glMask;
   uint32_t grMask;
   bool macroOn;      // dongle macro recorder (record/replay controller input; mode=dongle only)
@@ -48,7 +45,7 @@ struct LinkConfig {
 
 LinkConfig gLinkConfig = {
   "bt", "", "", "", IPAddress(), "", IPAddress(), IPAddress(),
-  "sinput", "touchpad", "none", "none", "none", "none", "none", 0, 0, false, false
+  "sinput", "touchpad", "none", 0, 0, false, false
 };
 bool wifiStarted  = false;
 bool gWifiEnabled = false;   // whether we intend to use Wi-Fi (gates automatic reconnection)
@@ -287,6 +284,12 @@ bool parseTcpPort(const String &s, uint16_t &out) {
   return true;
 }
 
+// The first comma-separated token of a config value (whole string if no comma)
+String firstCsvToken(const String &v) {
+  int c1 = v.indexOf(',');
+  return (c1 >= 0) ? v.substring(0, c1) : v;
+}
+
 // ==============================
 // Load config from /link.cfg
 //   1: ssid
@@ -298,11 +301,12 @@ bool parseTcpPort(const String &s, uint16_t &out) {
 //   7: mode ("bt" | "wifi" | "dongle")   NOTE: an older file without it means "bt" (the default)
 //   8: btname                 NOTE: empty means the auto-generated name
 //   9: usbmode ("sinput" | "ds4" | "switch" | "procon")   NOTE: the USB identity in dongle mode
-//  10: ds4map (the c,gl,gr tokens, comma-separated)
+//  10: ds4map (the C token)      NOTE: older files hold "c,gl,gr"; only the first
+//                                token is read, the GL/GR halves are ignored
 //  11: macro ("on" | "off")              NOTE: the dongle macro recorder
-//  12: switchmap (the c,gl,gr tokens for usbmode=switch, comma-separated)
+//  12: switchmap (the C token for usbmode=switch/procon)   NOTE: same as ds4map
 //  13: glmask,grmask (8-digit hex P2_BTN_* masks)   NOTE: an older file without it
-//      means both are 0, i.e. GL/GR keep following ds4map / switchmap
+//      means both are 0, i.e. GL/GR unassigned
 // ==============================
 // Returns whether the Wi-Fi fields are valid. mode/btname are applied as far as the
 // file could be read (BT runs on its defaults even with no file).
@@ -313,11 +317,7 @@ bool loadLinkConfig() {
   gLinkConfig.btName   = "";
   gLinkConfig.usbMode  = "sinput";
   gLinkConfig.ds4MapC  = "touchpad";
-  gLinkConfig.ds4MapGL = "none";
-  gLinkConfig.ds4MapGR = "none";
   gLinkConfig.swMapC   = "none";
-  gLinkConfig.swMapGL  = "none";
-  gLinkConfig.swMapGR  = "none";
   gLinkConfig.glMask   = 0;
   gLinkConfig.grMask   = 0;
   gLinkConfig.macroOn  = false;
@@ -363,35 +363,16 @@ bool loadLinkConfig() {
   gLinkConfig.btName  = btn;
   gLinkConfig.usbMode = normalizeUsbMode(usbm);
 
-  // ds4map is "c,gl,gr", comma-separated
-  {
-    int c1 = d4m.indexOf(',');
-    int c2 = (c1 >= 0) ? d4m.indexOf(',', c1 + 1) : -1;
-    String tc = (c1 >= 0) ? d4m.substring(0, c1) : d4m;
-    String tgl = (c1 >= 0 && c2 >= 0) ? d4m.substring(c1 + 1, c2) : "";
-    String tgr = (c2 >= 0) ? d4m.substring(c2 + 1) : "";
-    gLinkConfig.ds4MapC  = normalizeDs4Token(tc, "touchpad");
-    gLinkConfig.ds4MapGL = normalizeDs4Token(tgl, "none");
-    gLinkConfig.ds4MapGR = normalizeDs4Token(tgr, "none");
-  }
+  // ds4map / switchmap: the C token. Older files (and the app) still write
+  // "c,gl,gr"; only the first token is used, GL/GR are glmap/grmap's job now
+  gLinkConfig.ds4MapC = normalizeDs4Token(firstCsvToken(d4m), "touchpad");
+  gLinkConfig.swMapC  = normalizeSwitchToken(firstCsvToken(swm), "none");
 
   mac.toLowerCase();
   gLinkConfig.macroOn = (mac == "on" || mac == "1" || mac == "true");
 
-  // switchmap is "c,gl,gr", comma-separated (same shape as ds4map)
-  {
-    int c1 = swm.indexOf(',');
-    int c2 = (c1 >= 0) ? swm.indexOf(',', c1 + 1) : -1;
-    String tc = (c1 >= 0) ? swm.substring(0, c1) : swm;
-    String tgl = (c1 >= 0 && c2 >= 0) ? swm.substring(c1 + 1, c2) : "";
-    String tgr = (c2 >= 0) ? swm.substring(c2 + 1) : "";
-    gLinkConfig.swMapC  = normalizeSwitchToken(tc, "none");
-    gLinkConfig.swMapGL = normalizeSwitchToken(tgl, "none");
-    gLinkConfig.swMapGR = normalizeSwitchToken(tgr, "none");
-  }
-
   // glmask,grmask as hex. A missing line (an older file) or anything unparseable
-  // leaves both at 0, which is exactly "GL/GR follow ds4map / switchmap".
+  // leaves both at 0, which is exactly "GL/GR unassigned".
   {
     int c1 = gmk.indexOf(',');
     if (c1 >= 0) {
@@ -484,13 +465,9 @@ bool saveLinkConfig(const LinkConfig &cfg) {
   ok &= f.println(normalizeMode(cfg.mode)) > 0;
   ok &= f.println(cfg.btName) > 0;
   ok &= f.println(normalizeUsbMode(cfg.usbMode)) > 0;
-  ok &= f.println(normalizeDs4Token(cfg.ds4MapC, "touchpad") + "," +
-                  normalizeDs4Token(cfg.ds4MapGL, "none") + "," +
-                  normalizeDs4Token(cfg.ds4MapGR, "none")) > 0;
+  ok &= f.println(normalizeDs4Token(cfg.ds4MapC, "touchpad")) > 0;
   ok &= f.println(cfg.macroOn ? "on" : "off") > 0;
-  ok &= f.println(normalizeSwitchToken(cfg.swMapC, "none") + "," +
-                  normalizeSwitchToken(cfg.swMapGL, "none") + "," +
-                  normalizeSwitchToken(cfg.swMapGR, "none")) > 0;
+  ok &= f.println(normalizeSwitchToken(cfg.swMapC, "none")) > 0;
   {
     char buf[20];
     snprintf(buf, sizeof(buf), "%08lx,%08lx",
@@ -514,6 +491,31 @@ bool saveLinkConfig(const LinkConfig &cfg) {
   }
 
   Serial.println("[CFG] link.cfg saved");
+  return true;
+}
+
+// ==============================
+// First boot: write the factory default /link.cfg
+//   A board with no configuration file gets one written for the most common use:
+//   dongle mode, Pro Controller emulation, the macro recorder on, GL/GR unassigned.
+//   Called from setup() only, right after loadLinkConfig() — the one point where the
+//   flash is already being touched after USB is stable (see the two-stage boot note
+//   above setup()). Never called from RESET / the run loop, so a flash write cannot
+//   land in the middle of a console handshake or the serial start-up.
+// ==============================
+bool writeFactoryDefaultLinkConfig() {
+  // Every other field keeps its in-memory default (GL/GR unassigned: glMask/grMask = 0)
+  LinkConfig cfg = gLinkConfig;
+  cfg.mode    = "dongle";
+  cfg.usbMode = "procon";
+  cfg.macroOn = true;
+
+  Serial.println("[CFG] no link.cfg -> writing the factory default "
+                 "(mode=dongle usbmode=procon macro=on glmap=none grmap=none)");
+  if (!saveLinkConfig(cfg)) {
+    Serial.println("[CFG] factory default write failed -> staying on the in-memory defaults (mode=bt)");
+    return false;
+  }
   return true;
 }
 
@@ -1029,15 +1031,8 @@ void handleConfigCommand(const String &line) {
     }
     if (gLinkConfig.mode == "dongle") {
       Serial.print("usbmode="); Serial.println(gLinkConfig.usbMode);
-      Serial.print("ds4map=");
-      Serial.print(gLinkConfig.ds4MapC); Serial.print(",");
-      Serial.print(gLinkConfig.ds4MapGL); Serial.print(",");
-      Serial.println(gLinkConfig.ds4MapGR);
-      Serial.print("switchmap=");
-      Serial.print(gLinkConfig.swMapC); Serial.print(",");
-      Serial.print(gLinkConfig.swMapGL); Serial.print(",");
-      Serial.println(gLinkConfig.swMapGR);
-      // The GL/GR masks override the ds4map/switchmap GL/GR tokens when non-zero.
+      Serial.print("ds4map=");    Serial.println(gLinkConfig.ds4MapC);
+      Serial.print("switchmap="); Serial.println(gLinkConfig.swMapC);
       // The app uses the presence of these lines to detect feature support.
       Serial.print("glmap="); Serial.println(glgrMaskToTokens(gLinkConfig.glMask));
       Serial.print("grmap="); Serial.println(glgrMaskToTokens(gLinkConfig.grMask));
@@ -1192,27 +1187,12 @@ void handleConfigCommand(const String &line) {
     incomingCfg.usbMode = normalizeUsbMode(line.substring(8));
     Serial.print("[CFG] usbmode="); Serial.println(incomingCfg.usbMode);
   } else if (line.startsWith("ds4map=")) {
-    String v = line.substring(7);
-    int c1 = v.indexOf(',');
-    int c2 = (c1 >= 0) ? v.indexOf(',', c1 + 1) : -1;
-    incomingCfg.ds4MapC  = normalizeDs4Token((c1 >= 0) ? v.substring(0, c1) : v, "touchpad");
-    incomingCfg.ds4MapGL = normalizeDs4Token((c1 >= 0 && c2 >= 0) ? v.substring(c1 + 1, c2) : "", "none");
-    incomingCfg.ds4MapGR = normalizeDs4Token((c2 >= 0) ? v.substring(c2 + 1) : "", "none");
-    Serial.print("[CFG] ds4map=");
-    Serial.print(incomingCfg.ds4MapC); Serial.print(",");
-    Serial.print(incomingCfg.ds4MapGL); Serial.print(",");
-    Serial.println(incomingCfg.ds4MapGR);
+    // "c" or the older "c,gl,gr" (the app still sends the latter): only C counts
+    incomingCfg.ds4MapC = normalizeDs4Token(firstCsvToken(line.substring(7)), "touchpad");
+    Serial.print("[CFG] ds4map="); Serial.println(incomingCfg.ds4MapC);
   } else if (line.startsWith("switchmap=")) {
-    String v = line.substring(10);
-    int c1 = v.indexOf(',');
-    int c2 = (c1 >= 0) ? v.indexOf(',', c1 + 1) : -1;
-    incomingCfg.swMapC  = normalizeSwitchToken((c1 >= 0) ? v.substring(0, c1) : v, "none");
-    incomingCfg.swMapGL = normalizeSwitchToken((c1 >= 0 && c2 >= 0) ? v.substring(c1 + 1, c2) : "", "none");
-    incomingCfg.swMapGR = normalizeSwitchToken((c2 >= 0) ? v.substring(c2 + 1) : "", "none");
-    Serial.print("[CFG] switchmap=");
-    Serial.print(incomingCfg.swMapC); Serial.print(",");
-    Serial.print(incomingCfg.swMapGL); Serial.print(",");
-    Serial.println(incomingCfg.swMapGR);
+    incomingCfg.swMapC = normalizeSwitchToken(firstCsvToken(line.substring(10)), "none");
+    Serial.print("[CFG] switchmap="); Serial.println(incomingCfg.swMapC);
   } else if (line.startsWith("glmap=") || line.startsWith("grmap=")) {
     const bool isGl = line.startsWith("glmap=");
     bool ok = false;
@@ -2173,10 +2153,9 @@ void buildDS4FromProcon2(const Procon2Report &r, DS4State &s) {
   if (b & P2_BTN_HOME) s.buttons3 |= 0x01;      // PS
   if (b & P2_BTN_CAPTURE) s.buttons3 |= 0x02;   // touchpad click
 
-  // C / GL / GR follow their configured assignments
+  // C follows ds4map. GL/GR were already swapped for their glmap/grmap mask in
+  // dongleApplyReport; an unassigned paddle has nothing on a DS4 and does nothing
   if (b & P2_BTN_C) ds4ApplyToken(gLinkConfig.ds4MapC, s);
-  if (b & P2_BTN_GL) ds4ApplyToken(gLinkConfig.ds4MapGL, s);
-  if (b & P2_BTN_GR) ds4ApplyToken(gLinkConfig.ds4MapGR, s);
 
   // Sticks: 12-bit -> 8-bit. DS4 treats Y as positive downward, so invert
   s.lx = dongleScaleStick8(r.lx, false, gDongleCenter[0]);
@@ -2198,8 +2177,9 @@ void buildDS4FromProcon2(const Procon2Report &r, DS4State &s) {
 }
 
 // ---- Switch pad conversion (usbmode=switch: Pro Controller 2 -> Switch/Switch 2) ----
-// The HORI-compatible identity has no IMU and no rumble. C/GL/GR do not exist on it,
-// so switchmap assigns them to existing pad buttons (default none). The recorder's
+// The HORI-compatible identity has no IMU and no rumble. C does not exist on it, so
+// switchmap assigns it to an existing pad button (default none); GL/GR come in
+// already converted to their glmap/grmap mask by dongleApplyReport. The recorder's
 // feedback vibration still works (it goes to the controller over BLE, not to the
 // USB host).
 
@@ -2240,12 +2220,9 @@ void dongleApplySwitchReport(const Procon2Report &r) {
   if (b & P2_BTN_HOME) btns |= 1 << NSButton_Home;
   if (b & P2_BTN_CAPTURE) btns |= 1 << NSButton_Capture;
 
-  // C / GL / GR follow their configured assignments. With macro=on the C bit was
-  // already stripped upstream (C is the recorder's control button), so only the
-  // GL/GR assignments can fire there
+  // C follows switchmap. With macro=on the C bit was already stripped upstream
+  // (C is the recorder's control button), so nothing fires here then
   if (b & P2_BTN_C) btns |= switchTokenBits(gLinkConfig.swMapC);
-  if (b & P2_BTN_GL) btns |= switchTokenBits(gLinkConfig.swMapGL);
-  if (b & P2_BTN_GR) btns |= switchTokenBits(gLinkConfig.swMapGR);
 
   Gamepad.buttons(btns);
 
@@ -2266,8 +2243,9 @@ void dongleApplySwitchReport(const Procon2Report &r) {
 // re-centered to 2048 with our calibration). The IMU is rotated back into the
 // original Pro Controller's frame (see the comment in the function) and the gyro
 // rescaled from the Pro Controller 2's 14.286 LSB/dps to the Pro Controller's 16.4
-// (accel is 4096 LSB/g on both). C/GL/GR do not exist on a Pro Controller, so they
-// follow switchmap (the token set is the same Switch button vocabulary).
+// (accel is 4096 LSB/g on both). C does not exist on a Pro Controller, so it follows
+// switchmap (the token set is the same Switch button vocabulary); GL/GR arrive
+// already converted to their glmap/grmap mask by dongleApplyReport.
 
 // switchmap token -> (procon button byte index, bit)
 void proconApplyToken(const String &tok, uint8_t *btns) {
@@ -2318,10 +2296,8 @@ void buildProconFromProcon2(const Procon2Report &r, ProconState &s) {
   if (b & P2_BTN_L) s.buttons[2] |= 0x40;
   if (b & P2_BTN_ZL) s.buttons[2] |= 0x80;
 
-  // C / GL / GR follow switchmap (macro=on strips C upstream, same as everywhere)
+  // C follows switchmap (macro=on strips C upstream, same as everywhere)
   if (b & P2_BTN_C) proconApplyToken(gLinkConfig.swMapC, s.buttons);
-  if (b & P2_BTN_GL) proconApplyToken(gLinkConfig.swMapGL, s.buttons);
-  if (b & P2_BTN_GR) proconApplyToken(gLinkConfig.swMapGR, s.buttons);
 
   s.lx = proconRecenter(r.lx, gDongleCenter[0]);
   s.ly = proconRecenter(r.ly, gDongleCenter[1]);
@@ -2464,7 +2440,8 @@ void dongleApplyReport(const Procon2Report &in) {
   // identity-specific conversion runs. Every converter derives its output from
   // this raw mask, so the DS4 hat, the L2/R2 analog values and the procon dpad
   // bits all fall out of the existing code with no per-identity work.
-  // A zero mask leaves the paddle bit alone = the legacy ds4map/switchmap path.
+  // A zero mask leaves the paddle bit alone: sinput forwards it as a native paddle,
+  // the other identities have no such button and simply drop it.
   // This is also the single choke point macro playback goes through, so replays
   // follow whatever assignment is current at playback time.
   Procon2Report r = in;
@@ -3405,6 +3382,15 @@ void setup() {
   // Read the configuration and start only the selected transport (after USB is stable).
   // BT can start on its default name even with no configuration file.
   loadLinkConfig();
+
+  // First boot (or after FS FORMAT): no link.cfg at all. Write the factory default and
+  // load it back, so the board comes up as a dongle without any manual configuration.
+  // Only when the filesystem is actually usable — a board whose flash cannot be mounted
+  // keeps running on the in-memory defaults (BT needs no file) instead of retrying
+  // a write on every boot.
+  if (fsMounted && !LittleFS.exists("/link.cfg")) {
+    if (writeFactoryDefaultLinkConfig()) loadLinkConfig();
+  }
 
   // If the USB identity the configuration asks for differs from the one now running,
   // put the requested identity into the scratch register and reboot (the two-stage boot).

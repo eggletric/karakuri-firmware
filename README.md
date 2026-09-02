@@ -8,8 +8,8 @@ Pro Controller 2 into a USB gamepad for PC / Mac.
 The companion app is [KarakuriPad](https://github.com/eggletric/karakuri-pad),
 which sends the input and macros this firmware plays back.
 
-- **Bluetooth (default)** — no router required. KarakuriPad connects directly over BLE.
-  With no configuration at all, the board comes up as `Karakuri-XXXX`
+- **Bluetooth** — no router required. KarakuriPad connects directly over BLE.
+  The board advertises as `Karakuri-XXXX` unless `btname` is set
   (XXXX is a per-device fixed value)
 - **Wi-Fi (TCP)** — the traditional path, through a router. Switch between them
   with `mode` in `link.cfg`
@@ -23,6 +23,12 @@ which sends the input and macros this firmware plays back.
 
 The three modes are mutually exclusive — only the one configured in `link.cfg`
 starts up, because they share the same radio chip.
+
+**First boot:** a board with no `link.cfg` writes a factory default one
+(`mode=dongle`, `usbmode=procon`, `macro=on`, GL/GR unassigned) and reboots into
+it, so a freshly flashed Pico works as a Pro Controller dongle with no setup.
+Change the mode over USB serial (`CFG BEGIN` … `CFG END`, see
+[`docs/commands.md`](docs/commands.md)) to use BLE or Wi-Fi instead.
 
 ## Supported boards
 

@@ -2,7 +2,7 @@
 
 The firmware accepts the same commands over three transports.
 
-- **Bluetooth (BLE)** — the default. A Nordic UART Service (NUS)-compatible GATT
+- **Bluetooth (BLE)** — a Nordic UART Service (NUS)-compatible GATT
   service: writes to the RX characteristic (`6E400002-...`) are commands, and
   notifications on the TX characteristic (`6E400003-...`) are responses. No pairing required
 - **Wi-Fi (TCP)** — on the port configured in `link.cfg`. Only one connection at a time;
@@ -11,7 +11,10 @@ The firmware accepts the same commands over three transports.
   as a gamepad / macro command
 
 BLE and Wi-Fi are mutually exclusive: only the one selected by `mode` in `link.cfg`
-starts up (BLE by default).
+starts up. A board with no `link.cfg` (first boot, or after `FS FORMAT`) writes the
+factory default — `mode=dongle`, `usbmode=procon`, `macro=on`, GL/GR unassigned — on
+start-up and reboots into it. Only when the file cannot be written (the filesystem
+failed to mount) does the firmware fall back to its in-memory defaults, which are BLE.
 
 There is also a **dongle mode** (`mode=dongle`). The Pico acts as a BLE central and
 connects directly to a Pro Controller 2 (Switch 2 Pro Controller), streaming its input
@@ -24,22 +27,25 @@ The USB identity is selected with `usbmode`:
 - **sinput** (default) — an open standard supported natively by SDL3 (VID:PID 2E8A:10C6).
   C passes through as a misc button and GL/GR as paddles
 - **ds4** — DualShock 4 (054C:05C4) emulation. The identity to use if you want gyro plus
-  rumble working in Steam today. C/GL/GR do not exist on a DS4, so `ds4map` chooses what
-  they map to (default: C = touchpad click). CAPTURE maps to touchpad click, HOME to PS,
+  rumble working in Steam today. C does not exist on a DS4, so `ds4map` chooses what it
+  maps to (default: touchpad click); GL/GR follow `glmap`/`grmap` and do nothing until
+  assigned. CAPTURE maps to touchpad click, HOME to PS,
   MINUS to SHARE and PLUS to OPTIONS. For the IMU calibration SDL requests
   (feature 0x02) it returns stock-DS4 scales (16.384 LSB/dps, 8192 LSB/g) and converts
   the raw values into those units
 - **switch** — the same HORI-compatible Switch pad identity the bt/wifi modes use.
   Plug the dongle into a **Switch / Switch 2** and the Pro Controller 2 relays into it
-  as a licensed wired pad. The identity has no IMU and no rumble; C/GL/GR do not exist
-  on it, so `switchmap` chooses what they map to (default none for all three). The
+  as a licensed wired pad. The identity has no IMU and no rumble; C does not exist
+  on it, so `switchmap` chooses what it maps to (default none); GL/GR follow
+  `glmap`/`grmap` and do nothing until assigned. The
   macro recorder's feedback vibration still works — it goes to the controller over
   BLE, not to the USB host
 - **procon** — Pro Controller emulation (057E:2009, the console's own proprietary USB
   protocol). The identity to use on a **Switch / Switch 2** when you also want
   **gyro and rumble**: IMU passes through (relay only — never recorded or replayed),
   and the console's HD rumble is decoded and relayed to the Pro Controller 2 with
-  its amplitude preserved proportionally. C/GL/GR follow `switchmap`, same as usbmode=switch. On a Switch 1
+  its amplitude preserved proportionally. C follows `switchmap` and GL/GR follow
+  `glmap`/`grmap`, same as usbmode=switch. On a Switch 1
   the console setting **"Pro Controller Wired Communication" must be ON**
 
 **Only the Pro Controller 2 is supported** (the original Pro Controller from the
@@ -244,10 +250,10 @@ Set it two ways — both write the same value, so the last write wins:
 
 Precedence, per paddle independently:
 
-- **assignment set** → it replaces the paddle entirely: the `ds4map`/`switchmap` token
-  for that paddle and the native sinput paddle bit are both overridden
-- **assignment not set** (the default) → unchanged legacy behavior: sinput forwards the
-  native paddle bit, ds4/switch/procon apply their `ds4map`/`switchmap` token
+- **assignment set** → it replaces the paddle entirely, including the native sinput
+  paddle bit
+- **assignment not set** (the default) → sinput forwards the native paddle bit;
+  ds4/switch/procon have no such button, so the paddle does nothing there
 
 Assignments apply **regardless of `macro`** — only the on-controller gesture for
 *setting* them needs `macro=on`. Macro playback goes through the same conversion, so a
@@ -261,17 +267,19 @@ playback time. `DMACRO` prints the current assignments.
 ```
 CFG GET                 print the current configuration
 CFG BEGIN               begin receiving configuration
-mode=<bt|wifi|dongle>   operating mode (omitted or unknown values mean bt)
+mode=<bt|wifi|dongle>   operating mode (omitted or unknown values mean bt;
+                        a missing link.cfg is replaced by the factory default
+                        mode=dongle usbmode=procon macro=on at start-up)
 btname=<NAME>           BLE device name (empty auto-generates Karakuri-XXXX)
 usbmode=<sinput|ds4|switch|procon>  USB identity in dongle mode (default sinput)
-ds4map=<c>,<gl>,<gr>    C/GL/GR assignments in ds4 mode. Tokens:
+ds4map=<c>              C assignment in ds4 mode. Tokens:
                         none/touchpad/ps/share/options/l1/r1/l2/r2/l3/r3/
-                        cross/circle/square/triangle (default touchpad,none,none)
-                        The GL/GR halves are overridden when glmap/grmap is set
-switchmap=<c>,<gl>,<gr> C/GL/GR assignments in switch and procon modes. Tokens:
+                        cross/circle/square/triangle (default touchpad)
+                        The older c,gl,gr form is accepted; only c is used
+switchmap=<c>           C assignment in switch and procon modes. Tokens:
                         none/a/b/x/y/l/r/zl/zr/plus/minus/home/capture/
-                        lstick/rstick (default none,none,none)
-                        The GL/GR halves are overridden when glmap/grmap is set
+                        lstick/rstick (default none)
+                        The older c,gl,gr form is accepted; only c is used
 glmap=<tokens>          GL assignment, applied in every usbmode. Combine with '+'
 grmap=<tokens>          GR assignment, same syntax. Tokens:
                         none/up/down/left/right/a/b/x/y/l/r/zl/zr/
@@ -293,7 +301,8 @@ DMACRO                  dongle macro recorder status (state, slot occupancy,
                         and the current glmap/grmap assignments)
 FS INFO                 LittleFS status and whether link.cfg exists
 FS TEST                 read/write test
-FS FORMAT               format LittleFS (this erases the configuration too)
+FS FORMAT               format LittleFS (this erases the configuration too;
+                        the next boot writes the factory default link.cfg)
 ```
 
 - `CFG GET` prints **only the keys relevant to the active mode** (`btname` for bt,
