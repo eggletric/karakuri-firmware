@@ -2533,6 +2533,13 @@ const uint32_t DM_ARM_HOLD_MS = 1000;       // how long C+GL/GR must be held to 
 const uint32_t DM_START_DELAY_MS = 500;     // pause between releasing everything and recording
 const uint8_t  DM_SLOT_COUNT  = 8;
 const uint32_t DM_FILE_MAGIC  = 0x314D444B; // "KDM1" little-endian
+// A stick axis further than this from its calibrated center counts as "being
+// moved" when the leading idle is trimmed off a take (see dmTrimLeadingIdle).
+// Deliberately small: barely above the resting noise, far below any game's
+// deadzone, because the two failure modes are not symmetric. Too high and a
+// gentle opening tilt (slow walking) is thrown away for good; too low and a
+// finger resting on the stick merely stops the trim early, which is harmless.
+const int      DM_IDLE_STICK_TOLERANCE = 64;   // ~4.5% of the 1400-count range
 const uint32_t DM_ASSIGN_HOLD_MS    = 3000;  // how long a selection must be held still
 const uint32_t DM_ASSIGN_TIMEOUT_MS = 15000; // inactivity abort for the assignment states
 // Settle window after the trigger release, before selection accepts input. The
@@ -2769,11 +2776,42 @@ void dmStartRecording() {
   Serial.println("[DMACRO] recording started");
 }
 
+// Neutral = no button down and every stick axis within DM_IDLE_STICK_TOLERANCE of
+// the center that was calibrated for this connection (the samples hold raw values,
+// and a Pro Controller 2's resting center is a few dozen counts off 2048).
+// Takes an index rather than the sample: the Arduino prototype generator would
+// place a DongleMacroSample& prototype above the struct definition.
+bool dmSampleIsIdle(uint16_t idx) {
+  const DongleMacroSample &s = gDmSamples[idx];
+  if (s.buttons) return false;
+  const uint16_t axes[4] = { s.lx, s.ly, s.rx, s.ry };
+  for (int i = 0; i < 4; i++) {
+    if (abs((long)axes[i] - gDongleCenter[i]) > DM_IDLE_STICK_TOLERANCE) return false;
+  }
+  return true;
+}
+
+// Drops the neutral samples before the first real input: the reaction time between
+// the "recording started" buzz and the first press would otherwise replay as dead
+// time on every loop. The trailing idle (last input -> C) is kept on purpose: it is
+// how the loop interval is chosen. Runs in RAM while the host already sees neutral.
+void dmTrimLeadingIdle() {
+  uint16_t first = 0;
+  while (first < gDmCount && dmSampleIsIdle(first)) first++;
+  if (first == 0) return;
+  const uint16_t kept = gDmCount - first;
+  if (kept) memmove(gDmSamples, gDmSamples + first, (size_t)kept * sizeof(DongleMacroSample));
+  Serial.printf("[DMACRO] trimmed %u leading idle samples\n", (unsigned)first);
+  gDmCount = kept;
+}
+
 void dmStopRecording(const char *why) {
   Serial.printf("[DMACRO] recording stopped (%s, %u samples)\n", why, gDmCount);
   dongleSendNeutral();
+  dmTrimLeadingIdle();
   if (gDmCount == 0) {
-    // Nothing to save (C on the very first tick); skip slot selection
+    // Nothing to save (C on the very first tick, or nothing was ever touched);
+    // skip slot selection
     gDmState = DM_RELEASE_WAIT;
     dmVibrate(1, 400, 80);
     return;

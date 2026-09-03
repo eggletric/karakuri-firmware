@@ -202,6 +202,13 @@ Details:
   discarded** (the recorder's vibration is the only feedback channel). Recording is
   RAM-only; flash is written only after recording ends (while the host sees neutral),
   so relaying is never stalled by a flash write
+- **The leading idle is trimmed**: the neutral samples between the "recording
+  started" buzz and the first real input (a button, or a stick moved more than a
+  few percent from its calibrated center) are dropped when recording ends, so the
+  reaction time never replays as dead time. The **trailing idle is kept**: the gap
+  between the last input and the stopping C press becomes the loop interval, so
+  wait before pressing C for a slower loop. A take with no input at all is treated
+  like an empty one (one long vibration, nothing to save)
 - While playing, live input is **not** forwarded (C = stop is the only control),
   and game rumble is discarded (nobody is holding the controller the way the game
   assumes). Replayed input reports zero gyro/accel, i.e. a controller at rest
