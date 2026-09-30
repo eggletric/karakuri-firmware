@@ -151,11 +151,12 @@ public:
             writeS16(&p[18 + i * 2], _state.accel[i]);
         }
         p[29] = 0x1B;   // status (USB powered)
-        // Touchpad: bit7 of a finger ID means "not touching". Set every candidate slot,
-        // since interpretations differ
-        p[32] = 0x80;
+        // Touchpad: one touch report (p[32] is the report count, which recent Linux
+        // hid-playstation rejects above 3, dropping the whole report) whose two
+        // contacts (p[34], p[38]) have bit7 set, meaning "not touching". SDL skips the
+        // count and reads the same two contact bytes.
+        p[32] = 0x01;
         p[34] = 0x80;
-        p[36] = 0x80;
         p[38] = 0x80;
         _hid.sendReport(0x01, p, sizeof(p));
     }
